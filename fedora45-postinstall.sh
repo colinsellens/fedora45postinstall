@@ -1,0 +1,916 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  fedora45-postinstall.sh
+#  Post-install setup for Fedora 45 Workstation (GNOME)
+#
+#   1) Full system update
+#   2) RPM Fusion (free + nonfree, + free-tainted for DVD)
+#   3) Media codecs (full ffmpeg, GStreamer, VA-API, DVD, archive formats)
+#   4) NVIDIA proprietary driver (choose current / 580xx / 470xx branch)
+#   5) Other drivers & firmware (Broadcom Wi-Fi, GPU/audio firmware)
+#   6) Build tools (GCC, make, kernel-devel/headers)
+#   7) VMware Workstation Pro modules (vmmon/vmnet): build, sign, auto-rebuild
+#   Extras:
+#   8) Btrfs snapshots: snapper, snapshot before every dnf run, optional grub-btrfs
+#   9) Flathub (full) + Fedora third-party repos
+#  10) Firmware updates via fwupd
+#  11) GNOME tweaks: min/max buttons, AppIndicator, Dash to Dock, Extension Manager
+#  12) Microsoft core fonts (extracted from the original corefonts packages)
+#  13) OpenSSL 3 compatibility libraries
+#   A) All of the above - snapshot first, firmware last
+#   S) Software submenu: Brave Origin, qBittorrent, VLC, Bitwarden, Mullvad VPN,
+#      VS Code, Claude Code, Extension Manager  (dnf first, Flathub fallback)
+#
+#  Secure Boot: one signing key (the akmods MOK key) is shared by the NVIDIA
+#  akmod, the Broadcom akmod and the VMware modules, so you enrol ONE key once.
+#
+#  Usage:  sudo ./fedora45-postinstall.sh        (interactive menu)
+#          sudo ./fedora45-postinstall.sh A      (run everything)
+#          sudo ./fedora45-postinstall.sh 2 4    (run selected steps)
+#          sudo ./fedora45-postinstall.sh S      (go straight to the software menu)
+# =============================================================================
+
+set -uo pipefail
+
+LOG="/var/log/fedora45-postinstall.log"
+AKMODS_KEY="/etc/pki/akmods/private/private_key.priv"
+AKMODS_CERT="/etc/pki/akmods/certs/public_key.der"
+VMW_HELPER="/usr/local/sbin/vmware-modules-build"
+VMW_HOOK="/etc/kernel/install.d/99-vmware-modules.install"
+VMW_SERVICE="/etc/systemd/system/vmware-modules-check.service"
+VMW_PATCHED_SRC="/usr/local/src/vmware-host-modules"
+
+NEED_REBOOT=0
+MOK_PENDING=0
+declare -A RESULT
+
+# ---------- output helpers ---------------------------------------------------
+if [[ -t 1 ]]; then
+  C_B=$'\e[1m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_R=$'\e[31m'; C_C=$'\e[36m'; C_0=$'\e[0m'
+else
+  C_B=; C_G=; C_Y=; C_R=; C_C=; C_0=
+fi
+info() { echo "${C_C}==>${C_0} $*"; echo "[INFO] $*" >>"$LOG"; }
+ok()   { echo "${C_G} ✔${C_0}  $*"; echo "[ OK ] $*" >>"$LOG"; }
+warn() { echo "${C_Y} !${C_0}  $*"; echo "[WARN] $*" >>"$LOG"; }
+err()  { echo "${C_R} ✘${C_0}  $*"; echo "[FAIL] $*" >>"$LOG"; }
+
+# Run a non-interactive command, show output and append it to the log
+run() {
+  echo "+ $*" >>"$LOG"
+  "$@" 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+
+ask_yn() {  # ask_yn "Question" default(y/n)
+  local q="$1" def="${2:-n}" ans
+  local hint="[y/N]"; [[ $def == y ]] && hint="[Y/n]"
+  read -rp "    $q $hint " ans
+  ans="${ans:-$def}"
+  [[ ${ans,,} == y* ]]
+}
+
+# ---------- pre-flight -------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+  exec sudo -E bash "$0" "$@"
+fi
+touch "$LOG"; chmod 600 "$LOG"
+echo "===== $(date -Is) run started =====" >>"$LOG"
+
+# shellcheck disable=SC1091
+. /etc/os-release
+if [[ ${ID:-} != fedora ]]; then
+  err "This is not Fedora (ID=${ID:-unknown}). Aborting."; exit 1
+fi
+if [[ ${VERSION_ID:-} != 45 ]]; then
+  warn "Written for Fedora 45; you are on Fedora ${VERSION_ID:-?}. Most steps should still work."
+fi
+FEDVER="$(rpm -E %fedora)"
+command -v lspci >/dev/null || dnf -y install pciutils >>"$LOG" 2>&1
+
+# ---------- shared helpers ---------------------------------------------------
+secure_boot_enabled() {
+  command -v mokutil >/dev/null || dnf -y install mokutil >>"$LOG" 2>&1
+  mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
+}
+
+rpmfusion_enabled() {
+  rpm -q rpmfusion-free-release rpmfusion-nonfree-release >/dev/null 2>&1
+}
+
+require_rpmfusion() {
+  rpmfusion_enabled || { info "RPM Fusion is required first - enabling it."; step_rpmfusion; }
+}
+
+# Create the akmods signing key (if missing) and queue MOK enrolment if needed.
+# The same key signs NVIDIA/Broadcom akmods and the VMware modules.
+ensure_signing_key() {
+  run dnf -y install akmods mokutil openssl || return 1
+  if [[ ! -f $AKMODS_CERT || ! -f $AKMODS_KEY ]]; then
+    info "Generating module signing key (kmodgenca)…"
+    run kmodgenca -a || { err "kmodgenca failed"; return 1; }
+  fi
+  if ! secure_boot_enabled; then
+    info "Secure Boot is disabled - key created but enrolment not required."
+    return 0
+  fi
+  local t; t="$(mokutil --test-key "$AKMODS_CERT" 2>&1)"
+  if grep -qi 'already enrolled' <<<"$t"; then
+    ok "Signing key already enrolled in MOK."
+  elif grep -qi 'enrollment request' <<<"$t"; then
+    ok "Signing key enrolment already queued for next boot."; MOK_PENDING=1
+  else
+    echo
+    echo "${C_B}    Secure Boot is ON. The signing key must be enrolled in MOK.${C_0}"
+    echo "    Choose a short one-time password now; you'll type it ONCE at the"
+    echo "    blue 'MOK management' screen on the next reboot (Enroll MOK → Continue → Yes)."
+    echo "    Note: that screen usually uses a US keyboard layout."
+    echo
+    if mokutil --import "$AKMODS_CERT"; then
+      MOK_PENDING=1; NEED_REBOOT=1; ok "MOK enrolment queued."
+    else
+      err "mokutil --import failed"; return 1
+    fi
+  fi
+}
+
+gpu_lines() { lspci -nn | grep -Ei 'vga|3d controller|display controller'; }
+
+# ---------- STEP 1: update ---------------------------------------------------
+step_update() {
+  info "Configuring DNF (10 parallel downloads)…"
+  run dnf config-manager setopt max_parallel_downloads=10 || warn "Could not set dnf options"
+  info "Upgrading the system (this can take a while)…"
+  local before after
+  before="$(rpm -q kernel-core --last | head -1 | awk '{print $1}')"
+  run dnf -y upgrade --refresh || return 1
+  after="$(rpm -q kernel-core --last | head -1 | awk '{print $1}')"
+  if [[ $before != "$after" ]] || [[ "kernel-core-$(uname -r)" != "$after" ]]; then
+    warn "A newer kernel is installed than the one running - reboot when convenient."
+    NEED_REBOOT=1
+  fi
+  ok "System updated."
+}
+
+# ---------- STEP 2: RPM Fusion -----------------------------------------------
+step_rpmfusion() {
+  if rpmfusion_enabled; then
+    ok "RPM Fusion free/nonfree already installed."
+  else
+    # Fedora 45's rpm enforces signatures, so 'rpm -i URL' fails with NOKEY.
+    # dnf handles it correctly.
+    info "Installing RPM Fusion free + nonfree release packages…"
+    run dnf -y install \
+      "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDVER}.noarch.rpm" \
+      "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDVER}.noarch.rpm" \
+      || return 1
+  fi
+  info "Adding RPM Fusion free-tainted (libdvdcss)…"
+  run dnf -y install rpmfusion-free-release-tainted || warn "free-tainted repo not installed"
+  # AppStream metadata so RPM Fusion apps appear in GNOME Software
+  run dnf -y install rpmfusion-free-appstream-data rpmfusion-nonfree-appstream-data \
+    || warn "AppStream metadata not installed (cosmetic)"
+  ok "RPM Fusion enabled."
+}
+
+# ---------- STEP 3: codecs ---------------------------------------------------
+step_codecs() {
+  require_rpmfusion || return 1
+  local rc=0
+
+  info "Swapping ffmpeg-free for full ffmpeg (H.264/HEVC encoders, fdk-aac)…"
+  if rpm -q ffmpeg >/dev/null 2>&1; then ok "Full ffmpeg already installed."
+  else run dnf -y swap ffmpeg-free ffmpeg --allowerasing || { err "ffmpeg swap failed"; rc=1; }
+  fi
+
+  info "Installing GStreamer multimedia group…"
+  # dnf5: 'install @multimedia' (not 'update @multimedia', which fails on F45)
+  run dnf -y install @multimedia --setopt=install_weak_deps=False \
+    --exclude=PackageKit-gstreamer-plugin || { err "@multimedia failed"; rc=1; }
+
+  info "Installing DVD, OpenH264 and archive-format support…"
+  run dnf -y install libdvdcss gstreamer1-plugin-openh264 mozilla-openh264 \
+    unrar 7zip cabextract lame libva-utils || warn "Some extras failed to install"
+
+  info "Hardware video decode (VA-API) - detecting GPU…"
+  local gpus; gpus="$(gpu_lines)"; echo "$gpus" | sed 's/^/    /'
+  if grep -qi intel <<<"$gpus"; then
+    # Fedora 44+: install alongside, don't swap - libva prefers dri-nonfree/dri-freeworld
+    run dnf -y install intel-media-driver || warn "intel-media-driver failed"
+    run dnf -y install libva-intel-driver || true   # pre-Broadwell iGPUs
+  fi
+  if grep -Eqi 'amd|ati|radeon' <<<"$gpus" || grep -qi nvidia <<<"$gpus"; then
+    # Covers AMD and Nouveau. Do NOT 'swap mesa-va-drivers' on F44+ - it breaks mesa.
+    if ! run dnf -y install mesa-va-drivers-freeworld; then
+      warn "mesa-va-drivers-freeworld failed - usually a Mesa version skew right after a release."
+      if ask_yn "Retry with Fedora updates-testing enabled for this one install?" n; then
+        run dnf -y install mesa-va-drivers-freeworld --enablerepo=updates-testing \
+          || warn "Still failing - try again after the next 'dnf upgrade'."
+      fi
+    fi
+    if grep -Eqi 'amd|ati|radeon' <<<"$gpus"; then
+      run dnf -y swap mesa-vulkan-drivers mesa-vulkan-drivers-freeworld --allowerasing \
+        || warn "Vulkan freeworld swap skipped"
+    fi
+  fi
+  [[ $rc -eq 0 ]] && ok "Codecs installed. Check decode later with: vainfo"
+  return $rc
+}
+
+# ---------- STEP 4: NVIDIA driver --------------------------------------------
+step_nvidia() {
+  require_rpmfusion || return 1
+  local gpus br pkg v
+  gpus="$(gpu_lines)"
+
+  if grep -qi nvidia <<<"$gpus"; then
+    echo "    NVIDIA GPU detected:"; grep -i nvidia <<<"$gpus" | sed 's/^/      /'
+  else
+    warn "No NVIDIA GPU detected."
+    ask_yn "Install the NVIDIA driver anyway (e.g. card fitted later / eGPU)?" n || return 2
+  fi
+
+  echo "    Choose driver branch:"
+  echo "      1) Current  - RTX 20xx / GTX 16xx (Turing) and newer"
+  echo "      2) 580xx    - GTX 9xx/10xx (Maxwell, Pascal), Volta"
+  echo "      3) 470xx    - GTX 6xx/7xx (Kepler)"
+  echo "      s) Skip"
+  read -rp "    Branch [1]: " br
+  case "${br:-1}" in
+    1) pkg="akmod-nvidia xorg-x11-drv-nvidia-cuda" ;;
+    2) pkg="akmod-nvidia-580xx xorg-x11-drv-nvidia-580xx-cuda" ;;
+    3) pkg="akmod-nvidia-470xx xorg-x11-drv-nvidia-470xx-cuda" ;;
+    *) warn "Skipping NVIDIA."; return 2 ;;
+  esac
+
+  ensure_signing_key || return 1   # key must exist BEFORE akmods builds
+  run dnf -y install kernel-devel-matched || true
+  # shellcheck disable=SC2086
+  run dnf -y install $pkg libva-nvidia-driver || return 1
+  info "Building NVIDIA module now (akmods), a few minutes…"
+  run akmods --force --kernels "$(uname -r)" || warn "akmods reported errors (see $LOG)"
+  if v="$(modinfo -F version nvidia 2>/dev/null)"; then ok "NVIDIA module $v built."
+  else warn "NVIDIA module not found yet - akmods will retry at boot."; fi
+  NEED_REBOOT=1
+}
+
+# ---------- STEP 5: other drivers & firmware ---------------------------------
+step_drivers() {
+  require_rpmfusion || return 1
+  local did=0 net
+  net="$(lspci -nn | grep -i 'network controller')"
+
+  if grep -qi broadcom <<<"$net"; then
+    did=1
+    echo; echo "    Broadcom Wi-Fi detected:"; grep -i broadcom <<<"$net" | sed 's/^/      /'
+    echo "    Only BCM43xx chips unsupported by brcmfmac/b43 need the 'wl' driver."
+    if ask_yn "Install proprietary broadcom-wl (akmod-wl)?" n; then
+      ensure_signing_key || return 1
+      run dnf -y install broadcom-wl akmod-wl || return 1
+      run akmods --force --kernels "$(uname -r)" || true
+      NEED_REBOOT=1
+    fi
+  fi
+
+  info "Installing extra firmware…"
+  run dnf -y install linux-firmware intel-gpu-firmware amd-gpu-firmware \
+    nvidia-gpu-firmware alsa-sof-firmware 2>/dev/null || true
+
+  [[ $did -eq 0 ]] && info "No Broadcom Wi-Fi needing the proprietary driver found."
+  ok "Driver/firmware step complete."
+}
+
+# ---------- STEP 6: build tools ---------------------------------------------
+step_devtools() {
+  info "Installing GCC, make and kernel headers/devel…"
+  run dnf -y install gcc gcc-c++ make kernel-headers kernel-devel-matched \
+    elfutils-libelf-devel dwarves perl openssl git patch bc || return 1
+  # Headers for the *running* kernel too, if it's still in the repos
+  run dnf -y install "kernel-devel-$(uname -r)" \
+    || warn "kernel-devel for running kernel $(uname -r) not available - reboot into the newest kernel."
+  if [[ -d /lib/modules/$(uname -r)/build ]]; then
+    ok "Build tools ready for kernel $(uname -r)."
+  else
+    warn "No build tree for running kernel - reboot, then rerun step 7."
+  fi
+}
+
+# ---------- STEP 7: VMware modules ------------------------------------------
+write_vmware_helper() {
+  install -d /usr/local/sbin
+  cat >"$VMW_HELPER" <<'HELPER'
+#!/usr/bin/env bash
+# vmware-modules-build: build, install and sign vmmon/vmnet for one or more kernels.
+# Usage: vmware-modules-build [--if-missing] [KVER ...]   (default: every kernel with a build tree)
+# Source: patched tree in /usr/local/src/vmware-host-modules if present,
+#         otherwise VMware's bundled /usr/lib/vmware/modules/source/*.tar
+set -uo pipefail
+LOG=/var/log/vmware-modules-build.log
+KEY=/etc/pki/akmods/private/private_key.priv
+CERT=/etc/pki/akmods/certs/public_key.der
+PATCHED=/usr/local/src/vmware-host-modules
+BUNDLED=/usr/lib/vmware/modules/source
+IF_MISSING=0
+[[ ${1:-} == --if-missing ]] && { IF_MISSING=1; shift; }
+
+kvers=("$@")
+if [[ ${#kvers[@]} -eq 0 ]]; then
+  for d in /lib/modules/*/build; do [[ -e $d ]] && kvers+=("$(basename "$(dirname "$d")")"); done
+fi
+
+build_one() {
+  local kver=$1 tmp m ko signer fail=0
+  if [[ $IF_MISSING -eq 1 && -f /lib/modules/$kver/misc/vmmon.ko && -f /lib/modules/$kver/misc/vmnet.ko ]]; then
+    return 0
+  fi
+  [[ -d /lib/modules/$kver/build ]] || { echo "[$kver] no kernel-devel, skipping"; return 1; }
+  tmp=$(mktemp -d); trap 'rm -rf "$tmp"' RETURN
+  if [[ -d $PATCHED/vmmon-only && -d $PATCHED/vmnet-only ]]; then
+    cp -a "$PATCHED/vmmon-only" "$PATCHED/vmnet-only" "$tmp/"
+    echo "[$kver] using patched sources from $PATCHED"
+  elif [[ -f $BUNDLED/vmmon.tar && -f $BUNDLED/vmnet.tar ]]; then
+    tar -xf "$BUNDLED/vmmon.tar" -C "$tmp" && tar -xf "$BUNDLED/vmnet.tar" -C "$tmp"
+    echo "[$kver] using VMware bundled sources"
+  else
+    echo "[$kver] no VMware module sources found - is VMware Workstation installed?"; return 1
+  fi
+  signer=/lib/modules/$kver/build/scripts/sign-file
+  for m in vmmon vmnet; do
+    echo "[$kver] building $m…"
+    if ! make -C "$tmp/$m-only" VM_UNAME="$kver" -j"$(nproc)" >>"$LOG" 2>&1; then
+      echo "[$kver] $m FAILED to build (see $LOG)"; fail=1; continue
+    fi
+    ko=$(find "$tmp" -name "$m.ko" -print -quit)
+    [[ -z $ko && -f $tmp/$m.o ]] && ko=$tmp/$m.o     # VMware's Makefile copies the .ko to ../$m.o
+    [[ -n $ko ]] || { echo "[$kver] $m.ko not produced"; fail=1; continue; }
+    install -D -m 0644 "$ko" "/lib/modules/$kver/misc/$m.ko"
+    if [[ -f $KEY && -f $CERT && -x $signer ]]; then
+      "$signer" sha256 "$KEY" "$CERT" "/lib/modules/$kver/misc/$m.ko" && echo "[$kver] $m signed"
+    else
+      echo "[$kver] $m NOT signed (no key or sign-file) - fine if Secure Boot is off"
+    fi
+  done
+  command -v restorecon >/dev/null && restorecon -R "/lib/modules/$kver/misc" 2>/dev/null
+  depmod -a "$kver"
+  return $fail
+}
+
+rc=0
+for k in "${kvers[@]}"; do build_one "$k" 2>&1 | tee -a "$LOG"; [[ ${PIPESTATUS[0]} -eq 0 ]] || rc=1; done
+running=$(uname -r)
+if printf '%s\n' "${kvers[@]}" | grep -qx "$running" && [[ -f /lib/modules/$running/misc/vmmon.ko ]]; then
+  modprobe -r vmnet vmmon 2>/dev/null; modprobe vmmon && modprobe vmnet || rc=1
+fi
+exit $rc
+HELPER
+  chmod 755 "$VMW_HELPER"
+}
+
+write_vmware_autorebuild() {
+  # 1) Rebuild when a new kernel is installed (runs inside the dnf transaction)
+  install -d /etc/kernel/install.d
+  cat >"$VMW_HOOK" <<HOOK
+#!/bin/sh
+# Rebuild + sign VMware vmmon/vmnet whenever a kernel is installed.
+[ "\$1" = "add" ] || exit 0
+[ -x $VMW_HELPER ] || exit 0
+$VMW_HELPER "\$2" >/dev/null 2>&1 || echo "vmware-modules: build failed for \$2 - see /var/log/vmware-modules-build.log" >&2
+exit 0
+HOOK
+  chmod 755 "$VMW_HOOK"
+
+  # 2) Safety net at boot, in case the hook ran before kernel-devel was present
+  cat >"$VMW_SERVICE" <<UNIT
+[Unit]
+Description=Build VMware vmmon/vmnet for the running kernel if missing
+Before=vmware.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '$VMW_HELPER --if-missing "\$(uname -r)"'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable vmware-modules-check.service >>"$LOG" 2>&1
+}
+
+step_vmware() {
+  if [[ ! -f /usr/lib/vmware/modules/source/vmmon.tar ]]; then
+    warn "VMware Workstation Pro does not appear to be installed."
+    local bundle
+    read -rp "    Path to VMware-Workstation-*.bundle (blank to skip): " bundle
+    [[ -z $bundle ]] && { warn "Skipping VMware step."; return 2; }
+    [[ -f $bundle ]] || { err "File not found: $bundle"; return 1; }
+    info "Running the VMware installer (you'll need to accept its licence)…"
+    sh "$bundle" || { err "VMware installer failed"; return 1; }
+  fi
+
+  # Prerequisites
+  rpm -q gcc make >/dev/null 2>&1 && [[ -d /lib/modules/$(uname -r)/build ]] || step_devtools || return 1
+  if secure_boot_enabled; then
+    info "Secure Boot is enabled - modules will be signed."
+  fi
+  # Always create the key: harmless with SB off, and ready if you turn SB on later
+  ensure_signing_key || return 1
+
+  write_vmware_helper
+  info "Building vmmon/vmnet for all installed kernels with headers…"
+  if ! "$VMW_HELPER"; then
+    warn "Build with VMware's bundled sources failed (common on brand-new kernels)."
+    echo "    You can point me at a community-patched source tree (git) containing"
+    echo "    vmmon-only/ and vmnet-only/. This is third-party kernel code - review it first."
+    local url
+    read -rp "    Git URL of patched sources (blank to abort): " url
+    if [[ -n $url ]]; then
+      rm -rf "$VMW_PATCHED_SRC"
+      run git clone --depth 1 "$url" "$VMW_PATCHED_SRC" || return 1
+      "$VMW_HELPER" || { err "Patched build also failed - see /var/log/vmware-modules-build.log"; return 1; }
+    else
+      return 1
+    fi
+  fi
+
+  write_vmware_autorebuild
+  systemctl restart vmware.service >>"$LOG" 2>&1 || /etc/init.d/vmware restart >>"$LOG" 2>&1 || true
+
+  if secure_boot_enabled && [[ $MOK_PENDING -eq 1 ]]; then
+    warn "Modules are signed but the key isn't enrolled yet - VMware will work after the MOK reboot."
+    NEED_REBOOT=1
+  fi
+  ok "VMware modules built$(secure_boot_enabled && echo ', signed') and set to rebuild on kernel updates."
+}
+
+# ---------- helpers for running things as the desktop user -------------------
+desktop_user() { [[ -n ${SUDO_USER:-} && ${SUDO_USER} != root ]] && echo "$SUDO_USER"; }
+as_user() {   # run a command inside the desktop user's session (for gsettings etc.)
+  local u uid; u="$(desktop_user)" || return 1; uid="$(id -u "$u")"
+  sudo -u "$u" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    XDG_RUNTIME_DIR="/run/user/$uid" "$@"
+}
+flathub_enabled() { flatpak remotes --columns=name 2>/dev/null | grep -qx flathub; }
+
+# ---------- STEP 8: Btrfs snapshots ------------------------------------------
+step_snapshots() {
+  if [[ $(findmnt -n -o FSTYPE /) != btrfs ]]; then
+    warn "Root filesystem is not Btrfs - snapshots skipped."; return 2
+  fi
+  info "Installing snapper and the dnf5 actions plugin…"
+  run dnf -y install snapper libdnf5-plugin-actions || return 1
+  run dnf -y install btrfs-assistant || warn "btrfs-assistant (GUI for browsing/restoring snapshots) not installed"
+
+  if ! snapper -c root get-config >/dev/null 2>&1; then
+    run snapper -c root create-config / || return 1
+  fi
+  # Snapshots on dnf transactions only - no hourly timeline eating disk space
+  run snapper -c root set-config TIMELINE_CREATE=no NUMBER_LIMIT=10 NUMBER_LIMIT_IMPORTANT=5 || true
+  if u="$(desktop_user)"; then
+    run snapper -c root set-config "ALLOW_USERS=$u" SYNC_ACL=yes || true
+  fi
+  run systemctl enable --now snapper-cleanup.timer || true
+
+  # Snapshot before every dnf transaction (dnf5 actions plugin)
+  install -d /etc/dnf/libdnf5-plugins/actions.d
+  cat >/etc/dnf/libdnf5-plugins/actions.d/snapper.actions <<'ACT'
+# Take a snapper snapshot of / before every dnf transaction
+pre_transaction::::/usr/bin/snapper -c root create -c number -d dnf-transaction
+ACT
+  ok "dnf will snapshot / before every transaction."
+
+  run snapper -c root create -c important -d "baseline before fedora45-postinstall" \
+    && ok "Baseline snapshot taken."
+
+  echo
+  echo "    grub-btrfs adds a 'Fedora snapshots' submenu to GRUB so you can boot a"
+  echo "    snapshot if an update breaks the desktop. It's not in Fedora's repos, so it"
+  echo "    is built from upstream source (github.com/Antynea/grub-btrfs)."
+  echo "    Caveat: Fedora's /boot is separate ext4, so a snapshot boots with the"
+  echo "    CURRENT kernel - fine for recovering from a bad package, not a bad kernel."
+  if ask_yn "Install grub-btrfs?" n; then
+    run dnf -y install git make inotify-tools || return 1
+    rm -rf /usr/local/src/grub-btrfs
+    run git clone --depth 1 https://github.com/Antynea/grub-btrfs /usr/local/src/grub-btrfs || return 1
+    local cfg=/usr/local/src/grub-btrfs/config
+    sed -i \
+      -e 's|^#\?GRUB_BTRFS_GRUB_DIRNAME=.*|GRUB_BTRFS_GRUB_DIRNAME="/boot/grub2"|' \
+      -e 's|^#\?GRUB_BTRFS_MKCONFIG=.*|GRUB_BTRFS_MKCONFIG=/usr/sbin/grub2-mkconfig|' \
+      -e 's|^#\?GRUB_BTRFS_SCRIPT_CHECK=.*|GRUB_BTRFS_SCRIPT_CHECK=grub2-script-check|' "$cfg"
+    run make -C /usr/local/src/grub-btrfs install || return 1
+    run grub2-mkconfig -o /boot/grub2/grub.cfg || warn "grub2-mkconfig reported errors"
+    run systemctl enable --now grub-btrfsd || warn "grub-btrfsd service not started"
+    ok "grub-btrfs installed."
+  fi
+}
+
+# ---------- STEP 9: Flathub --------------------------------------------------
+step_flathub() {
+  run dnf -y install flatpak fedora-third-party || return 1
+  # Enables full Flathub plus Fedora's curated third-party repos (Chrome, Steam, NVIDIA)
+  run fedora-third-party enable || warn "fedora-third-party enable failed"
+  run flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || return 1
+  run flatpak remote-modify --enable flathub || true
+  flathub_enabled && ok "Flathub enabled ($(flatpak remote-ls flathub --app --columns=application 2>/dev/null | wc -l) apps visible)."
+}
+
+# ---------- STEP 10: firmware ------------------------------------------------
+step_firmware() {
+  run dnf -y install fwupd || return 1
+  run fwupdmgr refresh --force || warn "Could not refresh LVFS metadata"
+  echo
+  local out; out="$(fwupdmgr get-updates 2>&1)"; echo "$out" | sed 's/^/    /'; echo "$out" >>"$LOG"
+  if grep -Eqi 'no updat|no upgrades|no updatable' <<<"$out"; then
+    ok "Firmware is up to date."; return 0
+  fi
+  if grep -qi discharging /sys/class/power_supply/BAT*/status 2>/dev/null; then
+    warn "Running on battery - many firmware updates are refused. Plug into AC first."
+  fi
+  if ask_yn "Apply the firmware updates listed above?" n; then
+    fwupdmgr update || { err "fwupdmgr update failed"; return 1; }
+    NEED_REBOOT=1
+  else
+    return 2
+  fi
+}
+
+# ---------- STEP 11: GNOME tweaks -------------------------------------------
+add_extension() {   # enable a GNOME extension for the desktop user (takes effect at next login)
+  local uuid=$1 cur
+  cur="$(as_user gsettings get org.gnome.shell enabled-extensions 2>/dev/null)" || return 1
+  grep -q "'$uuid'" <<<"$cur" && return 0
+  if [[ $cur == "@as []" || $cur == "[]" ]]; then cur="['$uuid']"; else cur="${cur%]}, '$uuid']"; fi
+  as_user gsettings set org.gnome.shell enabled-extensions "$cur"
+}
+
+step_gnome() {
+  run dnf -y install gnome-tweaks || return 1
+
+  if ask_yn "Install AppIndicator support (tray icons for Discord, Nextcloud, Steam…)?" y; then
+    run dnf -y install gnome-shell-extension-appindicator && EXT_ADD+=("appindicatorsupport@rgcjonas.gmail.com")
+  fi
+  if ask_yn "Install Dash to Dock (always-visible dock)?" n; then
+    run dnf -y install gnome-shell-extension-dash-to-dock && EXT_ADD+=("dash-to-dock@micxgx.gmail.com")
+  fi
+
+  flathub_enabled || step_flathub
+  run flatpak install -y --noninteractive flathub com.mattjakeman.ExtensionManager \
+    || warn "Extension Manager not installed"
+
+  if desktop_user >/dev/null; then
+    as_user gsettings set org.gnome.desktop.wm.preferences button-layout 'appmenu:minimize,maximize,close' \
+      && ok "Minimise/maximise buttons enabled." || warn "Could not set window buttons (not in a GNOME session?)"
+    local e; for e in "${EXT_ADD[@]}"; do add_extension "$e" || warn "Could not enable $e"; done
+    [[ ${#EXT_ADD[@]} -gt 0 ]] && info "Extensions enable at your next log-in (Wayland can't reload the shell)."
+  else
+    warn "Run the script via sudo from your desktop session to apply per-user GNOME settings."
+  fi
+  ok "GNOME tweaks done."
+}
+EXT_ADD=()
+
+# ---------- STEP 12: Microsoft core fonts -----------------------------------
+step_msfonts() {
+  local dest=/usr/share/fonts/msttcore
+  if [[ -f $dest/arial.ttf ]]; then ok "Microsoft core fonts already installed."; return 0; fi
+  echo "    Installs Arial, Times New Roman, Verdana, Georgia, Courier New, Comic Sans,"
+  echo "    Impact, Trebuchet, Andale Mono and Webdings from the original corefonts"
+  echo "    packages on SourceForge. Fonts are extracted with cabextract; no third-party"
+  echo "    RPM or install scripts are run. They are covered by Microsoft's EULA:"
+  echo "    https://corefonts.sourceforge.net/eula.htm"
+  ask_yn "Do you accept the Microsoft core fonts EULA and want to install them?" n || return 2
+
+  run dnf -y install cabextract curl fontconfig || return 1
+  local tmp f fail=0; tmp="$(mktemp -d)"
+  for f in andale32 arial32 arialb32 comic32 courie32 georgi32 impact32 times32 trebuc32 verdan32 webdin32; do
+    if curl -fsSL --retry 3 -o "$tmp/$f.exe" "https://downloads.sourceforge.net/corefonts/$f.exe"; then
+      cabextract -q -L -F '*.ttf' -d "$tmp/ttf" "$tmp/$f.exe" >>"$LOG" 2>&1 || fail=1
+    else
+      warn "Download failed: $f.exe"; fail=1
+    fi
+  done
+  if compgen -G "$tmp/ttf/*.ttf" >/dev/null; then
+    install -d "$dest" && install -m 0644 "$tmp"/ttf/*.ttf "$dest/"
+    command -v restorecon >/dev/null && restorecon -R "$dest"
+    fc-cache -f "$dest" >>"$LOG" 2>&1
+    ok "Installed $(find "$dest" -name '*.ttf' | wc -l) font files to $dest."
+  else
+    err "No fonts extracted."; fail=1
+  fi
+  rm -rf "$tmp"
+  return $fail
+}
+
+# ---------- STEP 13: OpenSSL 3 compat ---------------------------------------
+step_openssl3() {
+  # Fedora 45 moved to OpenSSL 4; vendor binaries (VS Code's extension signer,
+  # older proprietary apps) still link libssl.so.3.
+  run dnf -y install openssl3-libs || return 1
+  ok "OpenSSL 3 compatibility libraries installed."
+}
+
+# =============================================================================
+#  SOFTWARE SUBMENU  (S)
+#  Rule: dnf/rpm first, Flathub as fallback - unless an app is Flathub-only.
+# =============================================================================
+declare -A SW_RESULT
+
+# Generic installer: sw_install "Name" "dnf packages" "flatpak app id"
+sw_install() {
+  local name=$1 pkgs=$2 fp=$3
+  if [[ -n $pkgs ]]; then
+    # shellcheck disable=SC2086
+    if run dnf -y install $pkgs; then ok "$name installed (dnf)."; return 0; fi
+    [[ -n $fp ]] && warn "$name: dnf install failed - falling back to Flathub."
+  fi
+  if [[ -n $fp ]]; then
+    flathub_enabled || step_flathub || return 1
+    if run flatpak install -y --noninteractive flathub "$fp"; then ok "$name installed (Flathub)."; return 0; fi
+  fi
+  err "$name could not be installed."; return 1
+}
+
+# Install Chrome Web Store extensions into Brave via managed policy.
+# Brave fetches and auto-updates them from the Web Store on next start.
+BRAVE_POLICY_FILE="/etc/brave/policies/managed/postinstall-extensions.json"
+BRAVE_EXTENSIONS=(
+  "nngceckbapebfimnlniiiahkandclblb"   # Bitwarden Password Manager
+)
+brave_policy_extensions() {
+  local mode="normal_installed" id first=1
+  echo
+  echo "    Adding the Bitwarden extension via Brave's managed policy."
+  echo "    Brave will show 'Managed by your organisation' and the extension"
+  echo "    can't be removed from inside Brave (edit/delete $BRAVE_POLICY_FILE instead)."
+  if ask_yn "Lock it fully (can't even be switched off)?" n; then mode="force_installed"; fi
+  install -d -m 0755 "$(dirname "$BRAVE_POLICY_FILE")"
+  {
+    echo '{'
+    echo '  "ExtensionSettings": {'
+    for id in "${BRAVE_EXTENSIONS[@]}"; do
+      [[ $first -eq 1 ]] || echo ','
+      first=0
+      printf '    "%s": {\n      "installation_mode": "%s",\n      "update_url": "https://clients2.google.com/service/update2/crx"\n    }' "$id" "$mode"
+    done
+    echo
+    echo '  }'
+    echo '}'
+  } >"$BRAVE_POLICY_FILE"
+  chmod 0644 "$BRAVE_POLICY_FILE"
+  if command -v python3 >/dev/null && ! python3 -m json.tool "$BRAVE_POLICY_FILE" >/dev/null 2>&1; then
+    err "Policy file is not valid JSON - removing it."; rm -f "$BRAVE_POLICY_FILE"; return 1
+  fi
+  ok "Bitwarden extension queued ($mode) - it appears next time Brave starts (check brave://policy)."
+}
+
+sw_brave() {
+  # Brave's own installer adds its repo and installs the Origin flavour via dnf
+  command -v curl >/dev/null || run dnf -y install curl
+  info "Running Brave's installer (FLAVOR=origin)…"
+  if curl -fsS https://dl.brave.com/install.sh | FLAVOR=origin sh 2>&1 | tee -a "$LOG"; [[ ${PIPESTATUS[0]} -eq 0 && ${PIPESTATUS[1]} -eq 0 ]]; then
+    ok "Brave Origin installed."
+    brave_policy_extensions
+    return 0
+  fi
+  warn "Brave's installer failed."
+  echo "    The only Flathub fallback is regular Brave (com.brave.Browser), NOT Brave Origin."
+  ask_yn "Install regular Brave from Flathub instead?" n || return 1
+  sw_install "Brave (Flathub)" "" com.brave.Browser || return 1
+  warn "The Flatpak can't read host policies - add the Bitwarden extension from the Web Store yourself."
+}
+
+sw_qbittorrent() { sw_install "qBittorrent" qbittorrent org.qbittorrent.qBittorrent; }
+
+sw_vlc() {
+  # VLC is in Fedora's own repo; HEVC etc. come from the codecs step (3)
+  rpmfusion_enabled || warn "RPM Fusion not enabled - some formats won't play until you run step 3."
+  sw_install "VLC" vlc org.videolan.VLC
+}
+
+sw_bitwarden() {
+  # Flathub-only: the official Bitwarden .rpm has no repo, so dnf never updates it,
+  # whereas the Flathub build updates with 'flatpak update' / GNOME Software.
+  sw_install "Bitwarden" "" com.bitwarden.desktop
+}
+
+sw_mullvad() {
+  if [[ ! -f /etc/yum.repos.d/mullvad.repo ]]; then
+    info "Adding Mullvad repository…"
+    # dnf5 syntax first; the older --add-repo form is kept as a fallback
+    run dnf config-manager addrepo --from-repofile=https://repository.mullvad.net/rpm/stable/mullvad.repo \
+      || run dnf config-manager --add-repo https://repository.mullvad.net/rpm/stable/mullvad.repo \
+      || { err "Could not add the Mullvad repo."; return 1; }
+  fi
+  # No official Mullvad Flatpak exists, so there is no fallback here
+  sw_install "Mullvad VPN" mullvad-vpn ""
+}
+
+sw_vscode() {
+  if [[ ! -f /etc/yum.repos.d/vscode.repo ]]; then
+    info "Adding Microsoft VS Code repository…"
+    run rpm --import https://packages.microsoft.com/keys/microsoft.asc || warn "Could not import Microsoft key"
+    cat >/etc/yum.repos.d/vscode.repo <<'REPO'
+[code]
+name=Visual Studio Code
+baseurl=https://packages.microsoft.com/yumrepos/vscode
+enabled=1
+autorefresh=1
+type=rpm-md
+gpgcheck=1
+gpgkey=https://packages.microsoft.com/keys/microsoft.asc
+REPO
+  fi
+  # Fedora 45 ships OpenSSL 4; VS Code's extension signer still needs libssl.so.3
+  run dnf -y install openssl3-libs || warn "openssl3-libs not installed - extension installs may fail"
+  sw_install "VS Code" code com.visualstudio.code
+}
+
+sw_claude_code() {
+  local fpr_ok="31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE" tmp got
+  if [[ ! -f /etc/yum.repos.d/claude-code.repo ]]; then
+    info "Adding Anthropic's Claude Code repository…"
+    tmp="$(mktemp -d)"
+    if curl -fsSL -o "$tmp/claude-code.asc" https://downloads.claude.ai/keys/claude-code.asc; then
+      got="$(gpg --show-keys --with-colons "$tmp/claude-code.asc" 2>/dev/null | awk -F: '/^fpr/{print $10; exit}')"
+      if [[ $got == "$fpr_ok" ]]; then
+        run rpm --import "$tmp/claude-code.asc"
+        cat >/etc/yum.repos.d/claude-code.repo <<'REPO'
+[claude-code]
+name=Claude Code
+baseurl=https://downloads.claude.ai/claude-code/rpm/stable
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://downloads.claude.ai/keys/claude-code.asc
+REPO
+      else
+        err "Claude Code signing key fingerprint mismatch (got '${got:-none}') - repo NOT added."
+      fi
+    else
+      warn "Could not download the Claude Code signing key."
+    fi
+    rm -rf "$tmp"
+  fi
+  if [[ -f /etc/yum.repos.d/claude-code.repo ]] && run dnf -y install claude-code; then
+    ok "Claude Code installed (dnf) - run 'claude' in a terminal to sign in."; return 0
+  fi
+  # No Flatpak exists; the fallback is Anthropic's native per-user installer
+  warn "dnf install failed - falling back to Anthropic's native installer (per-user, ~/.local/bin)."
+  local u; u="$(desktop_user)" || { err "No desktop user (run via sudo) - can't do the per-user install."; return 1; }
+  if as_user bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash' 2>&1 | tee -a "$LOG"; [[ ${PIPESTATUS[0]} -eq 0 ]]; then
+    ok "Claude Code installed for $u in ~/.local/bin (make sure that's on your PATH)."; return 0
+  fi
+  err "Claude Code could not be installed."; return 1
+}
+
+sw_extmanager() {
+  # Flathub-only by design
+  sw_install "Extension Manager" "" com.mattjakeman.ExtensionManager
+}
+
+SW_STEPS=(brave qbittorrent vlc bitwarden mullvad vscode claude_code extmanager)
+SW_LABELS=(
+  "Brave Origin + Bitwarden extension (policy)"
+  "qBittorrent"
+  "VLC media player"
+  "Bitwarden (Flathub)"
+  "Mullvad VPN (Mullvad repo)"
+  "VS Code (Microsoft repo)"
+  "Claude Code (Anthropic repo)"
+  "Extension Manager (Flathub)"
+)
+
+sw_run() {
+  local i=$1 name=${SW_STEPS[$1]}
+  echo; echo "${C_B}── Software: ${SW_LABELS[$i]} ──${C_0}"
+  "sw_$name"; local rc=$?
+  case $rc in
+    0) SW_RESULT[$name]="${C_G}done${C_0}" ;;
+    2) SW_RESULT[$name]="${C_Y}skipped${C_0}" ;;
+    *) SW_RESULT[$name]="${C_R}FAILED${C_0}" ;;
+  esac
+}
+
+software_menu() {
+  local choice tok i
+  while true; do
+    echo
+    echo "${C_B}Software${C_0}   (dnf first, Flathub fallback)"
+    echo "────────────────────────────────────────────────────────────"
+    for i in "${!SW_STEPS[@]}"; do
+      printf "  %2d) %-56s %s\n" $((i+1)) "${SW_LABELS[$i]}" "${SW_RESULT[${SW_STEPS[$i]}]:-}"
+    done
+    echo "   A) All of the above"
+    echo "   B) Back to main menu"
+    echo
+    read -rp "Select app(s), e.g. 1 3 6, or A: " choice
+    for tok in ${choice//,/ }; do
+      case ${tok^^} in
+        A) for i in "${!SW_STEPS[@]}"; do sw_run "$i"; done ;;
+        B|Q) return 0 ;;
+        *) if [[ $tok =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= ${#SW_STEPS[@]} )); then
+             sw_run $((tok-1))
+           else
+             warn "Unknown option: $tok"
+           fi ;;
+      esac
+    done
+  done
+}
+
+# ---------- menu -------------------------------------------------------------
+STEPS=(update rpmfusion codecs nvidia drivers devtools vmware snapshots flathub firmware gnome msfonts openssl3)
+LABELS=(
+  "Update system (dnf upgrade --refresh)"
+  "Enable RPM Fusion (free, nonfree, free-tainted)"
+  "Media codecs (ffmpeg, GStreamer, VA-API, DVD, rar/7z)"
+  "NVIDIA proprietary driver (akmod, choose branch)"
+  "Other drivers & firmware (Broadcom Wi-Fi, GPU/audio fw)"
+  "Build tools (GCC, make, kernel-devel/headers)"
+  "VMware Workstation modules (build, sign, auto-rebuild)"
+  "Btrfs snapshots (snapper, snapshot on every dnf run)"
+  "Flathub (full catalogue + Fedora third-party repos)"
+  "Firmware updates (fwupd / LVFS)"
+  "GNOME tweaks (min/max buttons, tray icons, Ext. Manager)"
+  "Microsoft core fonts (Arial, Times, Verdana…)"
+  "OpenSSL 3 compat libs (VS Code & vendor apps)"
+)
+# Order used by 'A': snapshot first so there's a rollback point, firmware near the end
+ALL_ORDER=(snapshots update rpmfusion codecs nvidia drivers devtools vmware flathub gnome msfonts openssl3 firmware)
+
+run_step() {
+  local i=$1 name=${STEPS[$1]}
+  echo; echo "${C_B}── Step $((i+1)): ${LABELS[$i]} ──${C_0}"
+  "step_$name"; local rc=$?
+  case $rc in
+    0) RESULT[$name]="${C_G}done${C_0}" ;;
+    2) RESULT[$name]="${C_Y}skipped${C_0}" ;;
+    *) RESULT[$name]="${C_R}FAILED${C_0}" ;;
+  esac
+}
+
+show_menu() {
+  local sb="off"; secure_boot_enabled && sb="ON"
+  echo
+  echo "${C_B}Fedora ${VERSION_ID} post-install${C_0}   kernel $(uname -r)   Secure Boot: $sb"
+  echo "────────────────────────────────────────────────────────────"
+  for i in "${!STEPS[@]}"; do
+    [[ $i -eq 7 ]] && echo "  ── Extras ──"
+    printf "  %2d) %-56s %s\n" $((i+1)) "${LABELS[$i]}" "${RESULT[${STEPS[$i]}]:-}"
+  done
+  echo "   A) All of the above (takes a snapshot first)"
+  echo "   S) Software…  (Brave, VLC, VS Code, Claude Code…)"
+  echo "   Q) Quit"
+  echo
+}
+
+handle_choice() {
+  local tok
+  for tok in ${1//,/ }; do
+    case ${tok^^} in
+      A) local n i
+         for n in "${ALL_ORDER[@]}"; do
+           for i in "${!STEPS[@]}"; do [[ ${STEPS[$i]} == "$n" ]] && run_step "$i"; done
+         done ;;
+      S) software_menu ;;
+      Q) return 1 ;;
+      *) if [[ $tok =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= ${#STEPS[@]} )); then
+           run_step $((tok-1))
+         else
+           warn "Unknown option: $tok"
+         fi ;;
+    esac
+  done
+}
+
+finish() {
+  echo
+  echo "${C_B}Summary${C_0}"
+  for i in "${!STEPS[@]}"; do
+    [[ -n ${RESULT[${STEPS[$i]}]:-} ]] && printf "  %-58s %s\n" "${LABELS[$i]}" "${RESULT[${STEPS[$i]}]}"
+  done
+  for i in "${!SW_STEPS[@]}"; do
+    [[ -n ${SW_RESULT[${SW_STEPS[$i]}]:-} ]] && printf "  %-58s %s
+" "${SW_LABELS[$i]}" "${SW_RESULT[${SW_STEPS[$i]}]}"
+  done
+  echo "  Log: $LOG"
+  if [[ $MOK_PENDING -eq 1 ]]; then
+    echo
+    echo "${C_Y}${C_B}  On reboot you'll see a blue MOK Management screen:${C_0}"
+    echo "    Enroll MOK → Continue → Yes → type the password you set → Reboot."
+    echo "    If you miss it (it times out), run this script's step 4, 5 or 7 again."
+  fi
+  if [[ $NEED_REBOOT -eq 1 ]] && ask_yn "Reboot now?" n; then systemctl reboot; fi
+}
+
+# Non-interactive: arguments on the command line
+if [[ $# -gt 0 ]]; then
+  handle_choice "$*"; finish; exit 0
+fi
+
+while true; do
+  show_menu
+  read -rp "Select step(s), e.g. 1 3 5, or A: " choice
+  handle_choice "$choice" || break
+done
+finish
