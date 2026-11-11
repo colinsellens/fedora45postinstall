@@ -158,6 +158,15 @@ sudo OPT_GRUB_BTRFS=n ./fedora45-postinstall.sh 8
 - **Log:** everything is written to `/var/log/fedora45-postinstall.log`.
 - **Other Fedora versions:** the script warns but carries on; most steps should still work.
 
+## Licence
+
+The script is free software, licensed under the [GNU General Public License v3.0 or later](LICENSE) (GPL-3.0-or-later).
+
+In short: you may use, study, change and share it. If you pass it on, changed or not, you must pass it on under the same licence, keep the copyright and licence notices, and make the source available. It comes with no warranty.
+
 ## Credits
 
-Accent Color Everywhere is by Fred6681 and licensed GPL-3.0-or-later; its licence is in `extensions/accent-color-everywhere@framagit.org/LICENSE`.
+- **colinsellens:** author and maintainer.
+- **Claude** (Anthropic's AI model): wrote much of the script and this README, working with the author.
+- **Fred6681:** [Accent Color Everywhere](https://framagit.org/Fred6681/accent-color-everywhere), bundled in `extensions/` under its own GPL-3.0-or-later licence.
+- The authors of the other extensions and apps this script installs.

@@ -3,6 +3,13 @@
 #  fedora45-postinstall.sh
 #  Post-install setup for Fedora 45 Workstation (GNOME)
 #
+#  Copyright (C) 2026 colinsellens
+#  SPDX-License-Identifier: GPL-3.0-or-later
+#  This program is free software: you can redistribute it and/or modify it under
+#  the terms of the GNU General Public License as published by the Free Software
+#  Foundation, either version 3 of the License, or (at your option) any later
+#  version. It comes with ABSOLUTELY NO WARRANTY. See the LICENSE file.
+#
 #   1) Full system update
 #   2) RPM Fusion (free + nonfree, + free-tainted for DVD)
 #   3) Media codecs (full ffmpeg, GStreamer, VA-API, DVD, archive formats)
