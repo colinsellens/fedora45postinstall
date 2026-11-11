@@ -14,7 +14,8 @@
 #   8) Btrfs snapshots: snapper, snapshot before every dnf run, optional grub-btrfs
 #   9) Flathub (full) + Fedora third-party repos
 #  10) Firmware updates via fwupd
-#  11) GNOME tweaks: min/max buttons, AppIndicator, Dash to Dock, Extension Manager
+#  11) GNOME tweaks: min/max buttons, AppIndicator, Dash to Dock, Extension Manager,
+#      Accent Color Everywhere (bundled in extensions/ in this repo)
 #  12) Microsoft core fonts (extracted from the original corefonts packages)
 #  13) OpenSSL 3 compatibility libraries
 #   A) All of the above - snapshot first, firmware last
@@ -39,6 +40,12 @@ VMW_HELPER="/usr/local/sbin/vmware-modules-build"
 VMW_HOOK="/etc/kernel/install.d/99-vmware-modules.install"
 VMW_SERVICE="/etc/systemd/system/vmware-modules-check.service"
 VMW_PATCHED_SRC="/usr/local/src/vmware-host-modules"
+
+# GNOME extensions shipped in this repo under extensions/<uuid>/. If the script
+# is run on its own (without the rest of the repo), they're fetched from GitHub.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+REPO_TARBALL="https://github.com/colinsellens/fedora45postinstall/archive/refs/heads/main.tar.gz"
+ACCENT_UUID="accent-color-everywhere@framagit.org"
 
 NEED_REBOOT=0
 MOK_PENDING=0
@@ -543,8 +550,69 @@ add_extension() {   # enable a GNOME extension for the desktop user (takes effec
   as_user gsettings set org.gnome.shell enabled-extensions "$cur"
 }
 
+# Install a GNOME extension bundled in this repo (extensions/<uuid>/) for the
+# desktop user, or system-wide if the script wasn't started via sudo.
+install_bundled_extension() {
+  local uuid=$1 src="$SCRIPT_DIR/extensions/$1" tmp="" dest u home shellver
+
+  if [[ ! -f $src/metadata.json ]]; then
+    info "extensions/$uuid is not next to this script - fetching it from GitHub…"
+    command -v curl >/dev/null && command -v tar >/dev/null || run dnf -y install curl tar || return 1
+    tmp="$(mktemp -d)"
+    if ! curl -fsSL --retry 3 "$REPO_TARBALL" \
+         | tar -xz -C "$tmp" --strip-components=1 --wildcards "*/extensions/$uuid/*" 2>>"$LOG"; then
+      err "Could not download $uuid from $REPO_TARBALL"; rm -rf "$tmp"; return 1
+    fi
+    src="$tmp/extensions/$uuid"
+  fi
+  if ! grep -q "\"uuid\": *\"$uuid\"" "$src/metadata.json" 2>/dev/null; then
+    err "$src does not look like the $uuid extension."; [[ -n $tmp ]] && rm -rf "$tmp"; return 1
+  fi
+
+  # Warn (don't block) if this GNOME Shell version isn't one the extension declares
+  shellver="$(gnome-shell --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+  if [[ -n $shellver ]] && ! grep -q "\"$shellver\"" "$src/metadata.json"; then
+    warn "$uuid doesn't list GNOME Shell $shellver as supported - it may refuse to load."
+  fi
+
+  if u="$(desktop_user)"; then
+    home="$(getent passwd "$u" | cut -d: -f6)"
+    dest="$home/.local/share/gnome-shell/extensions/$uuid"
+  else
+    u=""; dest="/usr/share/gnome-shell/extensions/$uuid"
+  fi
+
+  if [[ -e $dest/.git ]]; then
+    # A git checkout there is a working copy - never overwrite it
+    warn "$dest is a git checkout - leaving it untouched."
+  else
+    if [[ -n $u ]]; then
+      sudo -u "$u" mkdir -p "$dest" || { err "Could not create $dest"; [[ -n $tmp ]] && rm -rf "$tmp"; return 1; }
+    else
+      install -d "$dest"
+    fi
+    find "$dest" -mindepth 1 -delete            # clear any previous copy
+    cp -r --preserve=mode,timestamps "$src/." "$dest/" \
+      || { err "Copy to $dest failed"; [[ -n $tmp ]] && rm -rf "$tmp"; return 1; }
+    if [[ -d $dest/schemas ]] && command -v glib-compile-schemas >/dev/null; then
+      glib-compile-schemas "$dest/schemas" >>"$LOG" 2>&1 || warn "Could not recompile the extension's settings schema"
+    fi
+    [[ -n $u ]] && chown -R "$u:" "$dest"
+    command -v restorecon >/dev/null && restorecon -R "$dest" 2>/dev/null
+    ok "Installed $uuid to $dest."
+  fi
+  [[ -n $tmp ]] && rm -rf "$tmp"
+  return 0
+}
+
 step_gnome() {
   run dnf -y install gnome-tweaks || return 1
+
+  echo "    Accent Color Everywhere applies one accent colour (from the wallpaper, a"
+  echo "    colour you pick, or GNOME Settings) to the Shell, GTK 3/4, Qt apps and icons."
+  if ask_yn "Install the bundled Accent Color Everywhere extension?" y; then
+    install_bundled_extension "$ACCENT_UUID" && EXT_ADD+=("$ACCENT_UUID")
+  fi
 
   if ask_yn "Install AppIndicator support (tray icons for Discord, Nextcloud, Steam…)?" y; then
     run dnf -y install gnome-shell-extension-appindicator && EXT_ADD+=("appindicatorsupport@rgcjonas.gmail.com")
@@ -831,7 +899,7 @@ LABELS=(
   "Btrfs snapshots (snapper, snapshot on every dnf run)"
   "Flathub (full catalogue + Fedora third-party repos)"
   "Firmware updates (fwupd / LVFS)"
-  "GNOME tweaks (min/max buttons, tray icons, Ext. Manager)"
+  "GNOME tweaks (buttons, tray, accent colour, Ext. Mgr)"
   "Microsoft core fonts (Arial, Times, Verdana…)"
   "OpenSSL 3 compat libs (VS Code & vendor apps)"
 )
