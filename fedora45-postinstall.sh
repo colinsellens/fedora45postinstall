@@ -15,7 +15,8 @@
 #   9) Flathub (full) + Fedora third-party repos
 #  10) Firmware updates via fwupd
 #  11) GNOME tweaks: min/max buttons, AppIndicator, Dash to Dock, Extension Manager,
-#      Accent Color Everywhere (bundled in extensions/ in this repo)
+#      Accent Color Everywhere (bundled in extensions/ in this repo), plus the
+#      extensions.gnome.org extensions listed in GNOME_EXTENSIONS
 #  12) Microsoft core fonts (extracted from the original corefonts packages)
 #  13) OpenSSL 3 compatibility libraries
 #   A) All of the above - snapshot first, firmware last
@@ -72,6 +73,19 @@ OPT_BRAVE_FLATHUB_FALLBACK="${OPT_BRAVE_FLATHUB_FALLBACK:-n}"   # S: if Brave Or
 OPT_REBOOT_WHEN_DONE="${OPT_REBOOT_WHEN_DONE:-y}"       # reboot automatically at the end if a step needs it
 VMWARE_BUNDLE="${VMWARE_BUNDLE:-}"                      #  7: path to VMware-Workstation-*.bundle, used if VMware isn't installed yet
 VMWARE_PATCHED_URL="${VMWARE_PATCHED_URL:-}"            #  7: git URL of patched vmmon/vmnet sources, used if the bundled ones don't build
+
+# Extensions from extensions.gnome.org installed by step 11:  "ID | name"
+# ID is the number in the extension's URL: extensions.gnome.org/extension/<ID>/…
+# The build matching this GNOME Shell version is downloaded; delete a line to drop one.
+GNOME_EXTENSIONS=(
+  "19|User Themes"
+  "517|Caffeine"
+  "1319|GSConnect"
+  "779|Clipboard Indicator"
+  "2087|Desktop Icons NG (DING)"
+  "3960|Transparent Top Bar (Adjustable transparency)"
+)
+EGO_STATE="/var/lib/fedora45-postinstall/ego-extensions"   # "ID uuid" for each one installed
 
 # GNOME settings applied by step 11, one per line:  "schema key value"
 # Schemas of installed extensions work too (looked up in the extension's folder).
@@ -506,6 +520,14 @@ step_vmware() {
 # ---------- helpers for running things as the desktop user -------------------
 desktop_user() { [[ -n ${SUDO_USER:-} && ${SUDO_USER} != root ]] && echo "$SUDO_USER"; }
 user_home() { local u; u="$(desktop_user)" || return 1; getent passwd "$u" | cut -d: -f6; }
+extension_installed() {   # extension_installed UUID - for the desktop user or system-wide
+  local home
+  if home="$(user_home)" && [[ -f $home/.local/share/gnome-shell/extensions/$1/metadata.json ]]; then
+    return 0
+  fi
+  [[ -f /usr/share/gnome-shell/extensions/$1/metadata.json ]]
+}
+ego_uuid() { awk -v id="$1" '$1==id {print $2; exit}' "$EGO_STATE" 2>/dev/null; }   # uuid recorded for an EGO ID
 as_user() {   # run a command inside the desktop user's session (for gsettings etc.)
   local u uid; u="$(desktop_user)" || return 1; uid="$(id -u "$u")"
   sudo -u "$u" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
@@ -604,10 +626,75 @@ add_extension() {   # enable a GNOME extension for the desktop user (takes effec
   as_user gsettings set org.gnome.shell enabled-extensions "$cur"
 }
 
-# Install a GNOME extension bundled in this repo (extensions/<uuid>/) for the
-# desktop user, or system-wide if the script wasn't started via sudo.
+# Copy an unpacked extension (folder SRC containing metadata.json) into place
+# for the desktop user, or system-wide if the script wasn't started via sudo.
+deploy_extension() {   # deploy_extension UUID SRC
+  local uuid=$1 src=$2 dest u home
+  if u="$(desktop_user)"; then
+    home="$(getent passwd "$u" | cut -d: -f6)"
+    dest="$home/.local/share/gnome-shell/extensions/$uuid"
+  else
+    u=""; dest="/usr/share/gnome-shell/extensions/$uuid"
+  fi
+
+  if [[ -e $dest/.git ]]; then
+    # A git checkout there is a working copy - never overwrite it
+    warn "$dest is a git checkout - leaving it untouched."; return 0
+  fi
+  if [[ -n $u ]]; then
+    sudo -u "$u" mkdir -p "$dest" || { err "Could not create $dest"; return 1; }
+  else
+    install -d "$dest"
+  fi
+  find "$dest" -mindepth 1 -delete            # clear any previous copy
+  cp -r --preserve=mode,timestamps "$src/." "$dest/" || { err "Copy to $dest failed"; return 1; }
+  if [[ -d $dest/schemas ]] && command -v glib-compile-schemas >/dev/null; then
+    glib-compile-schemas "$dest/schemas" >>"$LOG" 2>&1 || warn "Could not recompile the extension's settings schema"
+  fi
+  [[ -n $u ]] && chown -R "$u:" "$dest"
+  command -v restorecon >/dev/null && restorecon -R "$dest" 2>/dev/null
+  ok "Installed $uuid to $dest."
+}
+
+# Install one extension from extensions.gnome.org by the number in its URL.
+install_ego_extension() {   # install_ego_extension ID "Name"
+  local id=$1 name=$2 shellver json uuid url tmp rc=0
+  uuid="$(ego_uuid "$id")"
+  if [[ -n $uuid ]] && extension_installed "$uuid"; then
+    ok "$name already installed."; EXT_ADD+=("$uuid"); return 0
+  fi
+  shellver="$(gnome-shell --version 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+  [[ -n $shellver ]] || { err "Can't tell the GNOME Shell version - is gnome-shell installed?"; return 1; }
+  command -v curl >/dev/null && command -v unzip >/dev/null || run dnf -y install curl unzip || return 1
+
+  info "$name: looking up the build for GNOME Shell $shellver…"
+  json="$(curl -fsSL --retry 2 "https://extensions.gnome.org/extension-info/?pk=$id&shell_version=$shellver" 2>>"$LOG")" \
+    || { warn "$name: extensions.gnome.org has no build for GNOME Shell $shellver (or can't be reached)."; return 1; }
+  uuid="$(grep -oE '"uuid": *"[^"]+"' <<<"$json" | head -1 | cut -d'"' -f4)"
+  url="$(grep -oE '"download_url": *"[^"]+"' <<<"$json" | head -1 | cut -d'"' -f4)"; url="${url//\\/}"
+  if [[ ! $uuid =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$ || $url != /download-extension/* ]]; then
+    err "$name: unexpected answer from extensions.gnome.org for ID $id."; return 1
+  fi
+
+  tmp="$(mktemp -d)"
+  if curl -fsSL --retry 2 -o "$tmp/ext.zip" "https://extensions.gnome.org$url" 2>>"$LOG" \
+     && unzip -q -o "$tmp/ext.zip" -d "$tmp/ext" >>"$LOG" 2>&1 \
+     && grep -qF "\"$uuid\"" "$tmp/ext/metadata.json" 2>/dev/null; then
+    deploy_extension "$uuid" "$tmp/ext" || rc=1
+  else
+    err "$name: download or unpack failed."; rc=1
+  fi
+  rm -rf "$tmp"
+  [[ $rc -eq 0 ]] || return 1
+
+  install -d "$(dirname "$EGO_STATE")"
+  { grep -v "^$id " "$EGO_STATE" 2>/dev/null; echo "$id $uuid"; } >"$EGO_STATE.new" && mv "$EGO_STATE.new" "$EGO_STATE"
+  EXT_ADD+=("$uuid")
+}
+
+# Install a GNOME extension bundled in this repo (extensions/<uuid>/).
 install_bundled_extension() {
-  local uuid=$1 src="$SCRIPT_DIR/extensions/$1" tmp="" dest u home shellver
+  local uuid=$1 src="$SCRIPT_DIR/extensions/$1" tmp="" shellver rc=0
 
   if [[ ! -f $src/metadata.json ]]; then
     info "extensions/$uuid is not next to this script - fetching it from GitHub…"
@@ -629,34 +716,9 @@ install_bundled_extension() {
     warn "$uuid doesn't list GNOME Shell $shellver as supported - it may refuse to load."
   fi
 
-  if u="$(desktop_user)"; then
-    home="$(getent passwd "$u" | cut -d: -f6)"
-    dest="$home/.local/share/gnome-shell/extensions/$uuid"
-  else
-    u=""; dest="/usr/share/gnome-shell/extensions/$uuid"
-  fi
-
-  if [[ -e $dest/.git ]]; then
-    # A git checkout there is a working copy - never overwrite it
-    warn "$dest is a git checkout - leaving it untouched."
-  else
-    if [[ -n $u ]]; then
-      sudo -u "$u" mkdir -p "$dest" || { err "Could not create $dest"; [[ -n $tmp ]] && rm -rf "$tmp"; return 1; }
-    else
-      install -d "$dest"
-    fi
-    find "$dest" -mindepth 1 -delete            # clear any previous copy
-    cp -r --preserve=mode,timestamps "$src/." "$dest/" \
-      || { err "Copy to $dest failed"; [[ -n $tmp ]] && rm -rf "$tmp"; return 1; }
-    if [[ -d $dest/schemas ]] && command -v glib-compile-schemas >/dev/null; then
-      glib-compile-schemas "$dest/schemas" >>"$LOG" 2>&1 || warn "Could not recompile the extension's settings schema"
-    fi
-    [[ -n $u ]] && chown -R "$u:" "$dest"
-    command -v restorecon >/dev/null && restorecon -R "$dest" 2>/dev/null
-    ok "Installed $uuid to $dest."
-  fi
+  deploy_extension "$uuid" "$src" || rc=1
   [[ -n $tmp ]] && rm -rf "$tmp"
-  return 0
+  return $rc
 }
 
 # Apply the GNOME_SETTINGS table for the desktop user.
@@ -699,6 +761,11 @@ step_gnome() {
   if opt OPT_DASH_TO_DOCK "Dash to Dock (always-visible dock)"; then
     run dnf -y install gnome-shell-extension-dash-to-dock && EXT_ADD+=("dash-to-dock@micxgx.gmail.com")
   fi
+  local row id name
+  for row in "${GNOME_EXTENSIONS[@]}"; do
+    IFS='|' read -r id name <<<"$row"
+    install_ego_extension "$id" "$name" || warn "$name was not installed."
+  done
 
   flathub_enabled || step_flathub
   run flatpak install -y --noninteractive flathub com.mattjakeman.ExtensionManager \
@@ -1012,13 +1079,7 @@ render_status() {
   esac
 }
 
-accent_installed() {
-  local home
-  if home="$(user_home)" && [[ -f $home/.local/share/gnome-shell/extensions/$ACCENT_UUID/metadata.json ]]; then
-    return 0
-  fi
-  [[ -f /usr/share/gnome-shell/extensions/$ACCENT_UUID/metadata.json ]]
-}
+accent_installed() { extension_installed "$ACCENT_UUID"; }
 
 status_update() {     # can't tell "fully updated" offline - only flag a pending kernel reboot
   local newest; newest="$(rpm -q kernel-core --last 2>/dev/null | head -1 | awk '{print $1}')"
@@ -1057,8 +1118,14 @@ status_flathub()  { flathub_enabled && echo ok; }
 status_firmware() { :; }   # needs a network check - only known after running the step
 status_gnome() {
   have gnome-tweaks || return
-  if [[ ${OPT_ACCENT_COLOR,,} == y* ]] && ! accent_installed; then echo "warn:accent extension not installed"
-  else echo ok; fi
+  local row id name uuid missing=0
+  [[ ${OPT_ACCENT_COLOR,,} == y* ]] && ! accent_installed && missing=1
+  for row in "${GNOME_EXTENSIONS[@]}"; do
+    IFS='|' read -r id name <<<"$row"
+    uuid="$(ego_uuid "$id")"
+    [[ -n $uuid ]] && extension_installed "$uuid" || missing=$((missing+1))
+  done
+  if [[ $missing -gt 0 ]]; then echo "warn:$missing extension(s) not installed"; else echo ok; fi
 }
 status_msfonts()  { [[ -f /usr/share/fonts/msttcore/arial.ttf ]] && echo ok; }
 status_openssl3() { have openssl3-libs && echo ok; }
