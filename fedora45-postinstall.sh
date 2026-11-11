@@ -921,7 +921,7 @@ step_openssl3() {
 # Download the newest GE-Proton release into Steam's compatibilitytools.d,
 # verified against the checksum published with it.
 install_proton_ge() {
-  local u home ctd tag base tmp rc=0
+  local u home ctd tag base tmp name found="" top="" rc=0
   u="$(desktop_user)" && home="$(user_home)" || { warn "No desktop user (run via sudo) - Proton-GE skipped."; return 1; }
   ctd="$home/.local/share/Steam/compatibilitytools.d"
   command -v curl >/dev/null || run dnf -y install curl || return 1
@@ -931,23 +931,30 @@ install_proton_ge() {
   if [[ ! $tag =~ ^GE-Proton[0-9]+-[0-9]+$ ]]; then
     warn "Could not work out the latest Proton-GE release (got '${tag:-nothing}')."; return 1
   fi
-  if [[ -d $ctd/$tag ]]; then ok "Proton-GE $tag already installed."; return 0; fi
+  if compgen -G "$ctd/$tag*" >/dev/null; then ok "Proton-GE $tag already installed."; return 0; fi
 
-  info "Downloading Proton-GE $tag (about 500 MB)…"
+  info "Downloading Proton-GE $tag (about 550 MB)…"
   base="$PROTON_GE_REPO/releases/download/$tag"
   tmp="$(mktemp -d -p /var/tmp)"            # /var/tmp is on disk; /tmp is RAM on Fedora
-  if curl -fsSL --retry 3 -o "$tmp/$tag.tar.gz" "$base/$tag.tar.gz" 2>>"$LOG" \
-     && curl -fsSL --retry 3 -o "$tmp/$tag.sha512sum" "$base/$tag.sha512sum" 2>>"$LOG"; then
-    if (cd "$tmp" && sha512sum -c "$tag.sha512sum" >>"$LOG" 2>&1); then
-      sudo -u "$u" mkdir -p "$ctd" \
-        && tar -xzf "$tmp/$tag.tar.gz" -C "$ctd" --no-same-owner \
-        && chown -R "$u:" "$ctd/$tag" \
-        || { err "Could not unpack Proton-GE into $ctd."; rm -rf "${ctd:?}/$tag"; rc=1; }
+  # Proton 11 onwards names its files per architecture (GE-Proton11-12-x86_64.tar.gz);
+  # earlier releases have no suffix. Try the new name first.
+  for name in "$tag-$(uname -m)" "$tag"; do
+    if curl -fsSL --retry 3 -o "$tmp/$name.sha512sum" "$base/$name.sha512sum" 2>>"$LOG"; then found=$name; break; fi
+  done
+  if [[ -n $found ]] && curl -fsSL --retry 3 -o "$tmp/$found.tar.gz" "$base/$found.tar.gz" 2>>"$LOG"; then
+    if (cd "$tmp" && sha512sum -c "$found.sha512sum" >>"$LOG" 2>&1); then
+      top="$(tar -tzf "$tmp/$found.tar.gz" 2>/dev/null | head -1 | cut -d/ -f1)"   # folder the archive unpacks to
+      if [[ $top == GE-Proton* ]] && sudo -u "$u" mkdir -p "$ctd" \
+         && tar -xzf "$tmp/$found.tar.gz" -C "$ctd" --no-same-owner && chown -R "$u:" "$ctd/$top"; then
+        :
+      else
+        err "Could not unpack Proton-GE into $ctd."; [[ $top == GE-Proton* ]] && rm -rf "${ctd:?}/$top"; rc=1
+      fi
     else
       err "Proton-GE $tag failed its checksum - not installed."; rc=1
     fi
   else
-    warn "Could not download Proton-GE $tag."; rc=1
+    warn "Could not download Proton-GE $tag (see $LOG)."; rc=1
   fi
   rm -rf "$tmp"
   [[ $rc -eq 0 ]] && ok "Proton-GE $tag installed - pick it in Steam under Settings > Compatibility (restart Steam first)."
