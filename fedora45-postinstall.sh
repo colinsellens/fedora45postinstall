@@ -61,15 +61,15 @@ ACCENT_UUID="accent-color-everywhere@framagit.org"
 # =============================================================================
 OPT_MESA_TESTING_RETRY="${OPT_MESA_TESTING_RETRY:-n}"   #  3: retry mesa-va-drivers-freeworld from updates-testing if it fails
 OPT_BROADCOM_WL="${OPT_BROADCOM_WL:-n}"                 #  5: proprietary broadcom-wl Wi-Fi driver (only if a Broadcom chip is found)
-OPT_GRUB_BTRFS="${OPT_GRUB_BTRFS:-n}"                   #  8: build grub-btrfs (boot snapshots from the GRUB menu)
-OPT_APPLY_FIRMWARE="${OPT_APPLY_FIRMWARE:-n}"           # 10: apply firmware updates (n = only list them)
+OPT_GRUB_BTRFS="${OPT_GRUB_BTRFS:-y}"                   #  8: build grub-btrfs (boot snapshots from the GRUB menu)
+OPT_APPLY_FIRMWARE="${OPT_APPLY_FIRMWARE:-y}"           # 10: apply firmware updates (n = only list them)
 OPT_ACCENT_COLOR="${OPT_ACCENT_COLOR:-y}"               # 11: bundled Accent Color Everywhere extension
 OPT_APPINDICATOR="${OPT_APPINDICATOR:-y}"               # 11: tray icons (AppIndicator extension)
-OPT_DASH_TO_DOCK="${OPT_DASH_TO_DOCK:-n}"               # 11: Dash to Dock
-OPT_MSFONTS_EULA="${OPT_MSFONTS_EULA:-n}"               # 12: y = you accept https://corefonts.sourceforge.net/eula.htm
+OPT_DASH_TO_DOCK="${OPT_DASH_TO_DOCK:-y}"               # 11: Dash to Dock
+OPT_MSFONTS_EULA="${OPT_MSFONTS_EULA:-y}"               # 12: y = you accept https://corefonts.sourceforge.net/eula.htm
 OPT_BRAVE_LOCK_BITWARDEN="${OPT_BRAVE_LOCK_BITWARDEN:-n}"       # S: force-install Bitwarden in Brave (can't be switched off)
 OPT_BRAVE_FLATHUB_FALLBACK="${OPT_BRAVE_FLATHUB_FALLBACK:-n}"   # S: if Brave Origin fails, install regular Brave from Flathub
-OPT_REBOOT_WHEN_DONE="${OPT_REBOOT_WHEN_DONE:-n}"       # reboot automatically at the end if a step needs it
+OPT_REBOOT_WHEN_DONE="${OPT_REBOOT_WHEN_DONE:-y}"       # reboot automatically at the end if a step needs it
 VMWARE_BUNDLE="${VMWARE_BUNDLE:-}"                      #  7: path to VMware-Workstation-*.bundle, used if VMware isn't installed yet
 VMWARE_PATCHED_URL="${VMWARE_PATCHED_URL:-}"            #  7: git URL of patched vmmon/vmnet sources, used if the bundled ones don't build
 
