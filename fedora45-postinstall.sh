@@ -16,7 +16,8 @@
 #  10) Firmware updates via fwupd
 #  11) GNOME tweaks: min/max buttons, AppIndicator, Dash to Dock, Extension Manager,
 #      Accent Color Everywhere (bundled in extensions/ in this repo), plus the
-#      extensions.gnome.org extensions listed in GNOME_EXTENSIONS
+#      extensions.gnome.org extensions listed in GNOME_EXTENSIONS, the desktop
+#      background, custom keyboard shortcuts and the GNOME_SETTINGS table
 #  12) Microsoft core fonts (extracted from the original corefonts packages)
 #  13) OpenSSL 3 compatibility libraries
 #   A) All of the above - snapshot first, firmware last
@@ -54,6 +55,7 @@ VMW_PATCHED_SRC="/usr/local/src/vmware-host-modules"
 # is run on its own (without the rest of the repo), they're fetched from GitHub.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 REPO_TARBALL="https://github.com/colinsellens/fedora45postinstall/archive/refs/heads/main.tar.gz"
+REPO_RAW="https://raw.githubusercontent.com/colinsellens/fedora45postinstall/main"
 ACCENT_UUID="accent-color-everywhere@framagit.org"
 
 # =============================================================================
@@ -87,11 +89,25 @@ GNOME_EXTENSIONS=(
 )
 EGO_STATE="/var/lib/fedora45-postinstall/ego-extensions"   # "ID uuid" for each one installed
 
+# Desktop background set by step 11: an image kept in this repo (empty = leave the background alone)
+WALLPAPER="${WALLPAPER-wallpapers/forest-fog.jpg}"
+
+# Custom keyboard shortcuts added by step 11:  "name | command | key combination"
+CUSTOM_SHORTCUTS=(
+  "Resources|gnome-system-monitor|<Control><Alt>Delete"
+)
+
 # GNOME settings applied by step 11, one per line:  "schema key value"
 # Schemas of installed extensions work too (looked up in the extension's folder).
 GNOME_SETTINGS=(
   "org.gnome.desktop.wm.preferences button-layout 'appmenu:minimize,maximize,close'"
   "org.gnome.desktop.peripherals.touchpad tap-to-click true"
+  "org.gnome.desktop.peripherals.mouse speed 0.5"                                  # pointer speed 75% (range -1 … 1)
+  "org.gnome.desktop.peripherals.touchpad speed 0.5"                               # same for the touchpad
+  "org.gnome.desktop.interface color-scheme 'prefer-dark'"                         # dark style
+  "org.gnome.desktop.session idle-delay 900"                                       # blank the screen after 15 minutes
+  "org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing'"       # no automatic suspend when plugged in
+  "org.gnome.settings-daemon.plugins.media-keys logout ['<Control><Alt>l']"        # log out: Ctrl+Alt+L (frees Ctrl+Alt+Del)
   "org.gnome.desktop.interface show-battery-percentage true"
   "org.gnome.desktop.interface clock-show-weekday true"
   "org.gnome.desktop.interface enable-hot-corners false"
@@ -721,6 +737,71 @@ install_bundled_extension() {
   return $rc
 }
 
+# Copy the WALLPAPER image from this repo into the user's backgrounds folder and set it.
+install_wallpaper() {
+  [[ -n $WALLPAPER ]] || return 0
+  local src="$SCRIPT_DIR/$WALLPAPER" name="${WALLPAPER##*/}" u home dest tmp="" rc=0
+  u="$(desktop_user)" && home="$(user_home)" || return 1
+  if [[ ! -f $src ]]; then
+    info "$WALLPAPER is not next to this script - fetching it from GitHub…"
+    tmp="$(mktemp -d)"; src="$tmp/$name"
+    curl -fsSL --retry 3 -o "$src" "$REPO_RAW/$WALLPAPER" 2>>"$LOG" \
+      || { warn "Could not download the wallpaper - background left unchanged."; rm -rf "$tmp"; return 1; }
+  fi
+  dest="$home/.local/share/backgrounds/$name"
+  if sudo -u "$u" mkdir -p "${dest%/*}" && install -m 0644 -o "$u" -g "$(id -gn "$u")" "$src" "$dest"; then
+    command -v restorecon >/dev/null && restorecon "$dest" 2>/dev/null
+    if as_user gsettings set org.gnome.desktop.background picture-uri "'file://$dest'" >>"$LOG" 2>&1 \
+       && as_user gsettings set org.gnome.desktop.background picture-uri-dark "'file://$dest'" >>"$LOG" 2>&1 \
+       && as_user gsettings set org.gnome.desktop.background picture-options "'zoom'" >>"$LOG" 2>&1; then
+      ok "Desktop background set to $dest."
+    else
+      warn "Wallpaper copied to $dest but could not be set (not in a GNOME session?)."; rc=1
+    fi
+  else
+    warn "Could not copy the wallpaper to $dest."; rc=1
+  fi
+  [[ -n $tmp ]] && rm -rf "$tmp"
+  return $rc
+}
+
+# Add the CUSTOM_SHORTCUTS table to GNOME's custom keyboard shortcuts.
+# A shortcut with the same name is updated in place; others are left alone.
+apply_custom_shortcuts() {
+  local schema=org.gnome.settings-daemon.plugins.media-keys
+  local base=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings
+  local row name cmd binding exe list p path i
+  for row in "${CUSTOM_SHORTCUTS[@]}"; do
+    IFS='|' read -r name cmd binding <<<"$row"
+    [[ -n $name && -n $cmd && -n $binding ]] || { warn "Ignoring malformed shortcut: $row"; continue; }
+    exe="${cmd%% *}"
+    if ! command -v "$exe" >/dev/null; then
+      run dnf -y install "/usr/bin/$exe" \
+        || warn "'$exe' is not installed - the '$name' shortcut won't do anything until it is."
+    fi
+    list="$(as_user gsettings get "$schema" custom-keybindings 2>/dev/null)" \
+      || { warn "Could not read the keyboard shortcuts (not in a GNOME session?)."; return 1; }
+    path=""
+    for p in $(grep -oE "$base/[^']+/" <<<"$list"); do
+      if [[ "$(as_user gsettings get "$schema.custom-keybinding:$p" name 2>/dev/null)" == "'$name'" ]]; then path=$p; break; fi
+    done
+    if [[ -z $path ]]; then
+      i=0; while grep -qF "$base/custom$i/" <<<"$list"; do i=$((i+1)); done
+      path="$base/custom$i/"
+      if [[ $list == "@as []" || $list == "[]" ]]; then list="['$path']"; else list="${list%]}, '$path']"; fi
+      as_user gsettings set "$schema" custom-keybindings "$list" >>"$LOG" 2>&1 \
+        || { warn "Could not add the '$name' shortcut."; continue; }
+    fi
+    if as_user gsettings set "$schema.custom-keybinding:$path" name "'$name'" >>"$LOG" 2>&1 \
+       && as_user gsettings set "$schema.custom-keybinding:$path" command "'$cmd'" >>"$LOG" 2>&1 \
+       && as_user gsettings set "$schema.custom-keybinding:$path" binding "'$binding'" >>"$LOG" 2>&1; then
+      ok "Shortcut '$name': $binding runs '$cmd'."
+    else
+      warn "Could not set the '$name' shortcut."
+    fi
+  done
+}
+
 # Apply the GNOME_SETTINGS table for the desktop user.
 apply_gnome_settings() {
   local line schema key value file home n=0 bad=0
@@ -773,6 +854,8 @@ step_gnome() {
 
   if desktop_user >/dev/null; then
     apply_gnome_settings
+    apply_custom_shortcuts
+    install_wallpaper
     local e; for e in "${EXT_ADD[@]}"; do add_extension "$e" || warn "Could not enable $e"; done
     [[ ${#EXT_ADD[@]} -gt 0 ]] && info "Extensions enable at your next log-in (Wayland can't reload the shell)."
   else
