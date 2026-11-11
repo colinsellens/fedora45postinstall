@@ -92,7 +92,7 @@ After the step:
 - Start Steam once and sign in, then choose Proton-GE under Settings > Compatibility.
 - To use GameMode and MangoHud for a game, set its launch options to `gamemoderun mangohud %command%`.
 
-Change `GAMING_PACKAGES` in the settings block to add or drop packages, and set `OPT_PROTON_GE=n` to skip the Proton-GE download (about 500 MB). Re-running the step fetches a newer Proton-GE if one has been released.
+Change `GAMING_PACKAGES` in the settings block to add or drop packages, and set `OPT_PROTON_GE=n` to skip the Proton-GE download (about 550 MB). Re-running the step fetches a newer Proton-GE if one has been released.
 
 ## GNOME extensions
 
