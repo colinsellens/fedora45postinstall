@@ -1,6 +1,6 @@
 # Fedora 45 post-install
 
-One script that takes a fresh Fedora 45 Workstation (GNOME) install to a finished desktop: updates, codecs, drivers, snapshots, software, GNOME extensions and settings.
+One script that takes a fresh Fedora 45 Workstation (GNOME) install to a finished desktop: updates, codecs, drivers, snapshots, software, gaming, GNOME extensions and settings.
 
 It runs unattended. Every choice is a setting at the top of the script rather than a question, and the menus show what is already installed on the machine.
 
@@ -15,7 +15,7 @@ sudo ./fedora45-postinstall.sh
 | Command | What it does |
 |---|---|
 | `sudo ./fedora45-postinstall.sh` | Interactive menu |
-| `sudo ./fedora45-postinstall.sh A` | Run every step (1–13) |
+| `sudo ./fedora45-postinstall.sh A` | Run every step (1–14) |
 | `sudo ./fedora45-postinstall.sh 2 4` | Run selected steps |
 | `sudo ./fedora45-postinstall.sh S` | Open the software menu |
 
@@ -40,6 +40,7 @@ The script also works on its own, without the rest of the repo. In that case the
 | 11 | GNOME | extensions, settings, keyboard shortcuts, wallpaper |
 | 12 | Microsoft core fonts | Arial, Times New Roman, Verdana and friends |
 | 13 | OpenSSL 3 compatibility | for VS Code and other vendor apps |
+| 14 | Gaming | Steam, Proton-GE, Wine, Lutris and performance tools |
 
 `A` runs them in a safe order: a snapshot first so there is a rollback point, firmware last. It does not include the software menu; run `S` for that.
 
@@ -67,6 +68,31 @@ To add an app, add one line to the `SOFTWARE` table in the script:
 ```
 
 Leave either the dnf or Flathub field empty to skip it. An app that needs its own repo can define a `sw_pre_<key>` function; `sw_post_<key>`, `sw_fallback_<key>` and `sw_status_<key>` are also picked up by name.
+
+## Gaming
+
+Step 14 sets the machine up for games using Fedora and RPM Fusion packages. It does not replace the kernel or add third-party gaming repos.
+
+| Item | Source | What it's for |
+|---|---|---|
+| Steam | RPM Fusion | Uses the host's graphics drivers; brings controller rules with it |
+| Proton-GE | Latest [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) release, checksum verified | Extra game compatibility; installed into Steam's `compatibilitytools.d` |
+| ProtonUp-Qt | Flathub | Add, update or remove Proton-GE versions later |
+| Wine, winetricks | Fedora | Windows apps outside Steam |
+| Lutris | Fedora | GOG, Epic, Battle.net and other non-Steam games |
+| NTSYNC | Fedora `ntsync-autoload` | Kernel-level Windows synchronisation, used automatically by current Proton-GE |
+| GameMode | Fedora | CPU governor and priority tweaks while a game runs; your user is added to the `gamemode` group |
+| MangoHud | Fedora | FPS and frame-time overlay |
+| gamescope | Fedora | Upscaling, frame limiting, fullscreen fixes |
+
+With the proprietary NVIDIA driver installed, the matching 32-bit NVIDIA libraries are added for Steam.
+
+After the step:
+
+- Start Steam once and sign in, then choose Proton-GE under Settings > Compatibility.
+- To use GameMode and MangoHud for a game, set its launch options to `gamemoderun mangohud %command%`.
+
+Change `GAMING_PACKAGES` in the settings block to add or drop packages, and set `OPT_PROTON_GE=n` to skip the Proton-GE download (about 500 MB). Re-running the step fetches a newer Proton-GE if one has been released.
 
 ## GNOME extensions
 
@@ -139,6 +165,7 @@ sudo OPT_GRUB_BTRFS=n ./fedora45-postinstall.sh 8
 | `OPT_APPINDICATOR` | y | 11 | AppIndicator tray icons |
 | `OPT_DASH_TO_DOCK` | y | 11 | Dash to Dock |
 | `OPT_MSFONTS_EULA` | y | 12 | You accept the [Microsoft core fonts EULA](https://corefonts.sourceforge.net/eula.htm) |
+| `OPT_PROTON_GE` | y | 14 | Download the latest Proton-GE into Steam |
 | `OPT_BRAVE_LOCK_BITWARDEN` | n | S | Force-install Bitwarden in Brave so it can't be switched off |
 | `OPT_BRAVE_FLATHUB_FALLBACK` | n | S | Install regular Brave from Flathub if Brave Origin fails |
 | `OPT_REBOOT_WHEN_DONE` | y | end | Reboot automatically if a step needs it |

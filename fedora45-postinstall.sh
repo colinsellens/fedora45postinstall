@@ -27,6 +27,8 @@
 #      background, custom keyboard shortcuts and the GNOME_SETTINGS table
 #  12) Microsoft core fonts (extracted from the original corefonts packages)
 #  13) OpenSSL 3 compatibility libraries
+#  14) Gaming: Steam (RPM Fusion), Proton-GE, ProtonUp-Qt, Wine, Lutris, NTSYNC,
+#      GameMode, MangoHud, gamescope
 #   A) All of the above - snapshot first, firmware last
 #   S) Software submenu: Brave Origin, qBittorrent, VLC, Bitwarden, Mullvad VPN,
 #      VS Code, Claude Code, Extension Manager  (dnf first, Flathub fallback)
@@ -77,6 +79,9 @@ OPT_ACCENT_COLOR="${OPT_ACCENT_COLOR:-y}"               # 11: bundled Accent Col
 OPT_APPINDICATOR="${OPT_APPINDICATOR:-y}"               # 11: tray icons (AppIndicator extension)
 OPT_DASH_TO_DOCK="${OPT_DASH_TO_DOCK:-y}"               # 11: Dash to Dock
 OPT_MSFONTS_EULA="${OPT_MSFONTS_EULA:-y}"               # 12: y = you accept https://corefonts.sourceforge.net/eula.htm
+OPT_PROTON_GE="${OPT_PROTON_GE:-y}"                     # 14: download the latest Proton-GE into Steam
+GAMING_PACKAGES="${GAMING_PACKAGES-wine winetricks ntsync-autoload gamemode mangohud gamescope lutris}"   # 14: installed alongside Steam
+PROTON_GE_REPO="https://github.com/GloriousEggroll/proton-ge-custom"
 OPT_BRAVE_LOCK_BITWARDEN="${OPT_BRAVE_LOCK_BITWARDEN:-n}"       # S: force-install Bitwarden in Brave (can't be switched off)
 OPT_BRAVE_FLATHUB_FALLBACK="${OPT_BRAVE_FLATHUB_FALLBACK:-n}"   # S: if Brave Origin fails, install regular Brave from Flathub
 OPT_REBOOT_WHEN_DONE="${OPT_REBOOT_WHEN_DONE:-y}"       # reboot automatically at the end if a step needs it
@@ -912,6 +917,91 @@ step_openssl3() {
   ok "OpenSSL 3 compatibility libraries installed."
 }
 
+# ---------- STEP 14: gaming ---------------------------------------------------
+# Download the newest GE-Proton release into Steam's compatibilitytools.d,
+# verified against the checksum published with it.
+install_proton_ge() {
+  local u home ctd tag base tmp rc=0
+  u="$(desktop_user)" && home="$(user_home)" || { warn "No desktop user (run via sudo) - Proton-GE skipped."; return 1; }
+  ctd="$home/.local/share/Steam/compatibilitytools.d"
+  command -v curl >/dev/null || run dnf -y install curl || return 1
+
+  # The "latest" page redirects to .../releases/tag/<name>
+  tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$PROTON_GE_REPO/releases/latest" 2>>"$LOG")"; tag="${tag##*/}"
+  if [[ ! $tag =~ ^GE-Proton[0-9]+-[0-9]+$ ]]; then
+    warn "Could not work out the latest Proton-GE release (got '${tag:-nothing}')."; return 1
+  fi
+  if [[ -d $ctd/$tag ]]; then ok "Proton-GE $tag already installed."; return 0; fi
+
+  info "Downloading Proton-GE $tag (about 500 MB)…"
+  base="$PROTON_GE_REPO/releases/download/$tag"
+  tmp="$(mktemp -d -p /var/tmp)"            # /var/tmp is on disk; /tmp is RAM on Fedora
+  if curl -fsSL --retry 3 -o "$tmp/$tag.tar.gz" "$base/$tag.tar.gz" 2>>"$LOG" \
+     && curl -fsSL --retry 3 -o "$tmp/$tag.sha512sum" "$base/$tag.sha512sum" 2>>"$LOG"; then
+    if (cd "$tmp" && sha512sum -c "$tag.sha512sum" >>"$LOG" 2>&1); then
+      sudo -u "$u" mkdir -p "$ctd" \
+        && tar -xzf "$tmp/$tag.tar.gz" -C "$ctd" --no-same-owner \
+        && chown -R "$u:" "$ctd/$tag" \
+        || { err "Could not unpack Proton-GE into $ctd."; rm -rf "${ctd:?}/$tag"; rc=1; }
+    else
+      err "Proton-GE $tag failed its checksum - not installed."; rc=1
+    fi
+  else
+    warn "Could not download Proton-GE $tag."; rc=1
+  fi
+  rm -rf "$tmp"
+  [[ $rc -eq 0 ]] && ok "Proton-GE $tag installed - pick it in Steam under Settings > Compatibility (restart Steam first)."
+  return $rc
+}
+
+proton_ge_installed() {
+  local home; home="$(user_home)" || return 1
+  compgen -G "$home/.local/share/Steam/compatibilitytools.d/GE-Proton*" >/dev/null
+}
+
+step_gaming() {
+  require_rpmfusion || return 1
+  local u pkg rc=0
+
+  info "Installing Steam (RPM Fusion)…"
+  run dnf -y install steam || { err "Steam could not be installed."; return 1; }
+
+  # Steam is 32-bit: with the proprietary NVIDIA driver it needs the matching 32-bit libraries
+  if have akmod-nvidia; then pkg=xorg-x11-drv-nvidia-libs.i686
+  elif have akmod-nvidia-580xx; then pkg=xorg-x11-drv-nvidia-580xx-libs.i686
+  elif have akmod-nvidia-470xx; then pkg=xorg-x11-drv-nvidia-470xx-libs.i686
+  else pkg=""; fi
+  if [[ -n $pkg ]]; then
+    run dnf -y install "$pkg" || { warn "$pkg not installed - Steam games may not find the NVIDIA driver."; rc=1; }
+  fi
+
+  info "Installing gaming extras: $GAMING_PACKAGES"
+  # shellcheck disable=SC2086
+  if ! run dnf -y install $GAMING_PACKAGES; then
+    warn "Installing them together failed - trying one at a time."
+    for pkg in $GAMING_PACKAGES; do
+      run dnf -y install "$pkg" || { warn "$pkg could not be installed."; rc=1; }
+    done
+  fi
+
+  # GameMode only lets members of its group change CPU governor and priorities
+  if u="$(desktop_user)" && getent group gamemode >/dev/null; then
+    if id -nG "$u" | tr ' ' '\n' | grep -qx gamemode; then :
+    else run usermod -aG gamemode "$u" && info "Added $u to the gamemode group (takes effect at next log-in)."; fi
+  fi
+
+  # ProtonUp-Qt: GUI for adding, updating and removing Proton-GE versions later
+  flathub_enabled || step_flathub
+  run flatpak install -y --noninteractive flathub net.davidotek.pupgui2 || { warn "ProtonUp-Qt not installed."; rc=1; }
+
+  if opt OPT_PROTON_GE "Install the latest Proton-GE"; then
+    install_proton_ge || rc=1
+  fi
+
+  [[ $rc -eq 0 ]] && ok "Gaming set-up done. Per-game launch options: gamemoderun mangohud %command%"
+  return $rc
+}
+
 # =============================================================================
 #  SOFTWARE SUBMENU  (S)
 #  Rule: dnf/rpm first, Flathub as fallback - unless an app is Flathub-only.
@@ -1219,9 +1309,16 @@ status_gnome() {
 }
 status_msfonts()  { [[ -f /usr/share/fonts/msttcore/arial.ttf ]] && echo ok; }
 status_openssl3() { have openssl3-libs && echo ok; }
+status_gaming() {
+  have steam || return
+  # shellcheck disable=SC2086
+  have $GAMING_PACKAGES || { echo "warn:some gaming extras missing"; return; }
+  if [[ ${OPT_PROTON_GE,,} == y* ]] && ! proton_ge_installed; then echo "warn:Proton-GE not installed"; return; fi
+  echo ok
+}
 
 # ---------- menu -------------------------------------------------------------
-STEPS=(update rpmfusion codecs nvidia drivers devtools vmware snapshots flathub firmware gnome msfonts openssl3)
+STEPS=(update rpmfusion codecs nvidia drivers devtools vmware snapshots flathub firmware gnome msfonts openssl3 gaming)
 LABELS=(
   "Update system (dnf upgrade --refresh)"
   "Enable RPM Fusion (free, nonfree, free-tainted)"
@@ -1236,9 +1333,10 @@ LABELS=(
   "GNOME tweaks (buttons, tray, accent colour, Ext. Mgr)"
   "Microsoft core fonts (Arial, Times, Verdana...)"
   "OpenSSL 3 compat libs (VS Code & vendor apps)"
+  "Gaming (Steam, Proton-GE, Wine, Lutris, GameMode, HUD)"
 )
 # Order used by 'A': snapshot first so there's a rollback point, firmware near the end
-ALL_ORDER=(snapshots update rpmfusion codecs nvidia drivers devtools vmware flathub gnome msfonts openssl3 firmware)
+ALL_ORDER=(snapshots update rpmfusion codecs nvidia drivers devtools vmware flathub gnome msfonts openssl3 gaming firmware)
 
 run_step() {
   local i=$1 name=${STEPS[$1]}
