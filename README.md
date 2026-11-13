@@ -40,7 +40,7 @@ The script also works on its own, without the rest of the repo. In that case the
 | 11 | GNOME | extensions, settings, keyboard shortcuts, wallpaper |
 | 12 | Microsoft core fonts | Arial, Times New Roman, Verdana and friends |
 | 13 | OpenSSL 3 compatibility | for VS Code and other vendor apps |
-| 14 | Gaming | Steam, Proton-GE, Wine, Lutris and performance tools |
+| 14 | Gaming | Steam, Proton-GE, Lutris and performance tools |
 
 `A` runs them in a safe order: a snapshot first so there is a rollback point, firmware last. It does not include the software menu; run `S` for that.
 
@@ -78,7 +78,6 @@ Step 14 sets the machine up for games using Fedora and RPM Fusion packages. It d
 | Steam | RPM Fusion | Uses the host's graphics drivers; brings controller rules with it |
 | Proton-GE | Latest [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom) release, checksum verified | Extra game compatibility; installed into Steam's `compatibilitytools.d` |
 | ProtonUp-Qt | Flathub | Add, update or remove Proton-GE versions later |
-| Wine, winetricks | Fedora | Windows apps outside Steam |
 | Lutris | Fedora | GOG, Epic, Battle.net and other non-Steam games |
 | NTSYNC | Fedora `ntsync-autoload` | Kernel-level Windows synchronisation, used automatically by current Proton-GE |
 | GameMode | Fedora | CPU governor and priority tweaks while a game runs; your user is added to the `gamemode` group |
@@ -91,6 +90,8 @@ After the step:
 
 - Start Steam once and sign in, then choose Proton-GE under Settings > Compatibility.
 - To use GameMode and MangoHud for a game, set its launch options to `gamemoderun mangohud %command%`.
+
+A standalone Wine is deliberately not installed: Steam (Proton) and Lutris each bring their own Wine builds. If you need one for other Windows programs, add `wine` to `GAMING_PACKAGES`.
 
 Change `GAMING_PACKAGES` in the settings block to add or drop packages, and set `OPT_PROTON_GE=n` to skip the Proton-GE download (about 550 MB). Re-running the step fetches a newer Proton-GE if one has been released.
 
