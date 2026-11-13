@@ -27,7 +27,7 @@
 #      background, custom keyboard shortcuts and the GNOME_SETTINGS table
 #  12) Microsoft core fonts (extracted from the original corefonts packages)
 #  13) OpenSSL 3 compatibility libraries
-#  14) Gaming: Steam (RPM Fusion), Proton-GE, ProtonUp-Qt, Wine, Lutris, NTSYNC,
+#  14) Gaming: Steam (RPM Fusion), Proton-GE, ProtonUp-Qt, Lutris, NTSYNC,
 #      GameMode, MangoHud, gamescope
 #   A) All of the above - snapshot first, firmware last
 #   S) Software submenu: Brave Origin, qBittorrent, VLC, Bitwarden, Mullvad VPN,
@@ -80,7 +80,7 @@ OPT_APPINDICATOR="${OPT_APPINDICATOR:-y}"               # 11: tray icons (AppInd
 OPT_DASH_TO_DOCK="${OPT_DASH_TO_DOCK:-y}"               # 11: Dash to Dock
 OPT_MSFONTS_EULA="${OPT_MSFONTS_EULA:-y}"               # 12: y = you accept https://corefonts.sourceforge.net/eula.htm
 OPT_PROTON_GE="${OPT_PROTON_GE:-y}"                     # 14: download the latest Proton-GE into Steam
-GAMING_PACKAGES="${GAMING_PACKAGES-wine winetricks ntsync-autoload gamemode mangohud gamescope lutris}"   # 14: installed alongside Steam
+GAMING_PACKAGES="${GAMING_PACKAGES-ntsync-autoload gamemode mangohud gamescope lutris}"   # 14: installed alongside Steam
 PROTON_GE_REPO="https://github.com/GloriousEggroll/proton-ge-custom"
 OPT_BRAVE_LOCK_BITWARDEN="${OPT_BRAVE_LOCK_BITWARDEN:-n}"       # S: force-install Bitwarden in Brave (can't be switched off)
 OPT_BRAVE_FLATHUB_FALLBACK="${OPT_BRAVE_FLATHUB_FALLBACK:-n}"   # S: if Brave Origin fails, install regular Brave from Flathub
@@ -1340,7 +1340,7 @@ LABELS=(
   "GNOME tweaks (buttons, tray, accent colour, Ext. Mgr)"
   "Microsoft core fonts (Arial, Times, Verdana...)"
   "OpenSSL 3 compat libs (VS Code & vendor apps)"
-  "Gaming (Steam, Proton-GE, Wine, Lutris, GameMode, HUD)"
+  "Gaming (Steam, Proton-GE, Lutris, GameMode, MangoHud)"
 )
 # Order used by 'A': snapshot first so there's a rollback point, firmware near the end
 ALL_ORDER=(snapshots update rpmfusion codecs nvidia drivers devtools vmware flathub gnome msfonts openssl3 gaming firmware)
